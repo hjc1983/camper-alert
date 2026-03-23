@@ -18,7 +18,7 @@ export function renderHtml(content: string) {
         </header>
         <main>
           <p>Your D1 Database contains the following data:</p>
-          <pre><code><span style="color: #0E838F">&gt; </span>SELECT * FROM comments LIMIT 3;<br>${content}</code></pre>
+          <pre><code><span style="color: #0E838F">&gt; </span>SELECT * FROM comments LIMIT 4;<br>${content}</code></pre>
           <small class="blue">
             <a target="_blank" href="https://developers.cloudflare.com/d1/tutorials/build-a-comments-api/">Build a comments API with Workers and D1</a>
           </small>
