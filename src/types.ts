@@ -9,6 +9,21 @@
 
 export interface Env {
   DB: D1Database;
+  INGEST_SECRET: string;
+}
+
+// ---------------------------------------------------------------------------
+// A listing as received from the scraper via POST /ingest
+// ---------------------------------------------------------------------------
+
+export interface Listing {
+  source_site: string;       // 'transfercar' | 'imoova'
+  from_city: string;
+  to_city: string;
+  available_date: string;    // ISO date: '2026-04-15'
+  vehicle_type?: string;     // 'campervan' | 'car' | null
+  price_per_day: number;
+  listing_url?: string;
 }
 
 // ---------------------------------------------------------------------------
