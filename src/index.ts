@@ -1,42 +1,35 @@
 /**
- * Campervan Alert — Matching Engine
+ * Campervan Alert — Worker
  * Cloudflare Worker (TypeScript) + D1
  *
- * Handlers:
- *   GET /run-matching   → manual trigger for testing
- *   scheduled           → cron trigger (every hour)
+ * Routes:
+ *   GET  /health         → liveness check
+ *   GET  /run-matching   → manual trigger for matching engine
+ *   POST /ingest         → receives scraped listings, writes to D1
+ *
+ * Scheduled:
+ *   cron "0 * * * *"    → runs matching engine every hour
  */
 
-import { Env, MatchCandidate, MatchStats } from "./types";
-
-// ---------------------------------------------------------------------------
-// Entry points
-// ---------------------------------------------------------------------------
+import { Env, Listing, MatchCandidate, MatchStats } from "./types";
 
 export default {
-  /**
-   * HTTP handler — manual trigger for testing in browser or curl.
-   * Example: curl https://camper-alert.<your-subdomain>.workers.dev/run-matching
-   */
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
+    if (url.pathname === "/ingest") {
+      return handleIngest(request, env);
+    }
     if (url.pathname === "/run-matching") {
       const stats = await runMatchingEngine(env);
       return Response.json({ ok: true, ...stats });
     }
-
     if (url.pathname === "/health") {
       return Response.json({ ok: true, ts: new Date().toISOString() });
     }
-
     return Response.json({ ok: true, message: "Campervan alert worker running" });
   },
 
-  /**
-   * Cron handler — Cloudflare calls this on the schedule in wrangler.json.
-   * Errors are caught and logged so a bad run doesn't silence future crons.
-   */
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     ctx.waitUntil(
       runMatchingEngine(env).catch((err) => {
@@ -47,7 +40,98 @@ export default {
 };
 
 // ---------------------------------------------------------------------------
-// Core matching engine
+// POST /ingest
+// Receives an array of listings from the scraper and upserts into D1.
+//
+// Request body:
+//   {
+//     "secret": "your-ingest-secret",
+//     "listings": [
+//       {
+//         "source_site": "transfercar",
+//         "from_city": "Sydney",
+//         "to_city": "Melbourne",
+//         "available_date": "2026-04-15",
+//         "vehicle_type": "campervan",
+//         "price_per_day": 1.00,
+//         "listing_url": "https://..."
+//       }
+//     ]
+//   }
+// ---------------------------------------------------------------------------
+
+async function handleIngest(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") {
+    return Response.json({ ok: false, error: "Method not allowed" }, { status: 405 });
+  }
+
+  let body: { secret?: string; listings?: Listing[] };
+  try {
+    body = await request.json();
+  } catch {
+    return Response.json({ ok: false, error: "Invalid JSON body" }, { status: 400 });
+  }
+
+  if (!env.INGEST_SECRET || body.secret !== env.INGEST_SECRET) {
+    return Response.json({ ok: false, error: "Unauthorised" }, { status: 401 });
+  }
+
+  const listings = body.listings;
+  if (!Array.isArray(listings) || listings.length === 0) {
+    return Response.json({ ok: false, error: "No listings provided" }, { status: 400 });
+  }
+
+  const required: (keyof Listing)[] = ["source_site", "from_city", "to_city", "available_date", "price_per_day"];
+  for (const listing of listings) {
+    for (const field of required) {
+      if (listing[field] === undefined || listing[field] === null) {
+        return Response.json({ ok: false, error: `Missing required field: ${field}` }, { status: 400 });
+      }
+    }
+  }
+
+  const results = await upsertListings(env, listings);
+  console.log(`Ingest complete: ${results.inserted} inserted, ${results.updated} updated`);
+  return Response.json({ ok: true, ...results });
+}
+
+async function upsertListings(
+  env: Env,
+  listings: Listing[]
+): Promise<{ inserted: number; updated: number; total: number }> {
+  const statements = listings.map((l) =>
+    env.DB.prepare(`
+      INSERT INTO listings (
+        id, source_site, from_city, to_city,
+        available_date, vehicle_type, price_per_day,
+        listing_url, first_seen_at, last_seen_at, is_active
+      ) VALUES (
+        lower(hex(randomblob(16))), ?, ?, ?,
+        ?, ?, ?, ?, datetime('now'), datetime('now'), 1
+      )
+      ON CONFLICT (source_site, from_city, to_city, available_date)
+      DO UPDATE SET
+        price_per_day = excluded.price_per_day,
+        listing_url   = excluded.listing_url,
+        last_seen_at  = datetime('now'),
+        is_active     = 1
+    `).bind(
+      l.source_site, l.from_city, l.to_city,
+      l.available_date, l.vehicle_type ?? null,
+      l.price_per_day, l.listing_url ?? null
+    )
+  );
+
+  const batchResults = await env.DB.batch(statements);
+  let inserted = 0;
+  for (const result of batchResults) {
+    if ((result.meta?.changes ?? 0) >= 1) inserted++;
+  }
+  return { inserted, updated: batchResults.length - inserted, total: listings.length };
+}
+
+// ---------------------------------------------------------------------------
+// Matching engine
 // ---------------------------------------------------------------------------
 
 async function runMatchingEngine(env: Env): Promise<MatchStats> {
@@ -59,9 +143,6 @@ async function runMatchingEngine(env: Env): Promise<MatchStats> {
     run_at: new Date().toISOString(),
   };
 
-  // Step 1 — Single JOIN query: route + date + price + freshness + active status.
-  // Pulls only listings first_seen in the last 2 hours (matches cron frequency).
-  // Returns every alert that could match — delta + cap checks happen in TS below.
   const candidates = await fetchCandidates(env);
   stats.candidates = candidates.length;
 
@@ -70,24 +151,13 @@ async function runMatchingEngine(env: Env): Promise<MatchStats> {
     return stats;
   }
 
-  // Step 2 — For each candidate: delta check → cap check → queue
   for (const row of candidates) {
-    // Delta check: has this exact listing already triggered this exact alert?
     const alreadyNotified = await checkAlreadyNotified(env, row.alert_id, row.listing_id);
-    if (alreadyNotified) {
-      stats.skipped_delta++;
-      continue;
-    }
+    if (alreadyNotified) { stats.skipped_delta++; continue; }
 
-    // Daily cap check: how many notifications sent today for this alert?
     const todaysCount = await getTodaysNotificationCount(env, row.alert_id);
-    const dailyCap = row.max_notifications_per_day ?? 3;
-    if (todaysCount >= dailyCap) {
-      stats.skipped_cap++;
-      continue;
-    }
+    if (todaysCount >= (row.max_notifications_per_day ?? 3)) { stats.skipped_cap++; continue; }
 
-    // All checks passed — write pending notification to D1
     await queueNotification(env, row);
     stats.queued++;
   }
@@ -96,12 +166,8 @@ async function runMatchingEngine(env: Env): Promise<MatchStats> {
   return stats;
 }
 
-// ---------------------------------------------------------------------------
-// Step 1 — Candidate query (single D1 JOIN)
-// ---------------------------------------------------------------------------
-
 async function fetchCandidates(env: Env): Promise<MatchCandidate[]> {
-  const query = `
+  const result = await env.DB.prepare(`
     SELECT
       a.id                        AS alert_id,
       a.user_id                   AS user_id,
@@ -126,85 +192,35 @@ async function fetchCandidates(env: Env): Promise<MatchCandidate[]> {
       AND a.expires_at > datetime('now')
       AND l.first_seen_at > datetime('now', '-2 hours')
     ORDER BY a.id, l.price_per_day ASC
-  `;
-
-  const result = await env.DB.prepare(query).all<MatchCandidate>();
+  `).all<MatchCandidate>();
   return result.results ?? [];
 }
 
-// ---------------------------------------------------------------------------
-// Step 2a — Delta check
-// ---------------------------------------------------------------------------
-
-async function checkAlreadyNotified(
-  env: Env,
-  alertId: string,
-  listingId: string
-): Promise<boolean> {
+async function checkAlreadyNotified(env: Env, alertId: string, listingId: string): Promise<boolean> {
   const result = await env.DB.prepare(`
-    SELECT COUNT(*) AS cnt
-    FROM notifications
-    WHERE alert_id   = ?
-      AND listing_id = ?
-  `)
-    .bind(alertId, listingId)
-    .first<{ cnt: number }>();
-
+    SELECT COUNT(*) AS cnt FROM notifications
+    WHERE alert_id = ? AND listing_id = ?
+  `).bind(alertId, listingId).first<{ cnt: number }>();
   return (result?.cnt ?? 0) > 0;
 }
 
-// ---------------------------------------------------------------------------
-// Step 2b — Daily cap check
-// ---------------------------------------------------------------------------
-
 async function getTodaysNotificationCount(env: Env, alertId: string): Promise<number> {
   const result = await env.DB.prepare(`
-    SELECT COUNT(*) AS cnt
-    FROM notifications
-    WHERE alert_id   = ?
-      AND date(sent_at) = date('now')
-      AND status        = 'sent'
-  `)
-    .bind(alertId)
-    .first<{ cnt: number }>();
-
+    SELECT COUNT(*) AS cnt FROM notifications
+    WHERE alert_id = ? AND date(sent_at) = date('now') AND status = 'sent'
+  `).bind(alertId).first<{ cnt: number }>();
   return result?.cnt ?? 0;
 }
 
-// ---------------------------------------------------------------------------
-// Step 2c — Queue notification
-// ---------------------------------------------------------------------------
-
 async function queueNotification(env: Env, row: MatchCandidate): Promise<void> {
-  const message = buildMessage(row);
-
-  // Write to D1 BEFORE dispatching — guarantees delta check catches it
-  // even if dispatch crashes, preventing double-sends on retry.
-  await env.DB.prepare(`
-    INSERT INTO notifications (
-      id, alert_id, listing_id,
-      channel, payload, status, sent_at
-    ) VALUES (
-      lower(hex(randomblob(16))),
-      ?, ?,
-      'pending', ?, 'pending', datetime('now')
-    )
-  `)
-    .bind(row.alert_id, row.listing_id, JSON.stringify({ message, row }))
-    .run();
-
-  console.log(`Queued notification: alert=${row.alert_id} listing=${row.listing_id}`);
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-function buildMessage(row: MatchCandidate): string {
-  return (
+  const message =
     `New deal: ${row.from_city} → ${row.to_city} ` +
-    `on ${row.available_date} ` +
-    `for $${row.price_per_day}/day ` +
-    `via ${row.source_site}`
-  );
+    `on ${row.available_date} for $${row.price_per_day}/day via ${row.source_site}`;
+
+  await env.DB.prepare(`
+    INSERT INTO notifications (id, alert_id, listing_id, channel, payload, status, sent_at)
+    VALUES (lower(hex(randomblob(16))), ?, ?, 'pending', ?, 'pending', datetime('now'))
+  `).bind(row.alert_id, row.listing_id, JSON.stringify({ message, row })).run();
+
+  console.log(`Queued: alert=${row.alert_id} listing=${row.listing_id}`);
 }
