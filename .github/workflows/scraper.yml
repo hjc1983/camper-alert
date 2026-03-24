@@ -1,0 +1,37 @@
+name: Scraper
+
+on:
+  # Run every 2 hours — adjust to taste
+  schedule:
+    - cron: "0 */2 * * *"
+
+  # Allow manual trigger from GitHub Actions UI
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install scraper dependencies
+        run: npm install
+        working-directory: scraper
+
+      - name: Install Playwright browsers
+        run: npx playwright install chromium --with-deps
+        working-directory: scraper
+
+      - name: Run scraper
+        run: npx ts-node index.ts
+        working-directory: scraper
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          INGEST_SECRET: ${{ secrets.INGEST_SECRET }}
