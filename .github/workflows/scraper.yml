@@ -30,7 +30,7 @@ jobs:
         working-directory: src/scraper
 
       - name: Run scraper
-        run: npx ts-node index.ts
+        run: npm run scrape
         working-directory: src/scraper
         env:
           WORKER_URL: ${{ secrets.WORKER_URL }}
